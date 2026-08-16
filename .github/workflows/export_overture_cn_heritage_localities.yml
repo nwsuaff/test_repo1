@@ -1,0 +1,167 @@
+name: export-overture-cn-heritage-localities
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install DuckDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet duckdb==1.3.2
+      - name: Export named heritage candidates and division labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          from pathlib import Path
+          import duckdb
+
+          out = Path('out')
+          release = '2026-06-17.0'
+          places = f"s3://overturemaps-us-west-2/release/{release}/theme=places/type=place/*"
+          divisions = f"s3://overturemaps-us-west-2/release/{release}/theme=divisions/type=division/*"
+          con = duckdb.connect()
+          con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
+          con.execute("SET s3_region='us-west-2'; SET enable_progress_bar=false; SET preserve_insertion_order=false;")
+
+          countries = "('CN','HK','MO','TW')"
+          bbox = "bbox.xmin BETWEEN 73.0 AND 135.5 AND bbox.ymin BETWEEN 17.5 AND 54.5"
+          named = "names.primary IS NOT NULL AND trim(names.primary) <> ''"
+          candidate = """(
+              list_contains(taxonomy.hierarchy, 'cultural_and_historic')
+              OR list_contains(taxonomy.hierarchy, 'religious_organization')
+              OR basic_category IN ('museum','cultural_center')
+              OR taxonomy.primary IN (
+                  'museum','history_museum','art_museum','science_museum','community_museum',
+                  'modern_art_museum','childrens_museum','civilization_museum','contemporary_art_museum',
+                  'textile_museum','computer_museum','design_museum','asian_art_museum','aviation_museum',
+                  'decorative_arts_museum','sports_museum','photography_museum','state_museum','military_museum'
+              )
+          )"""
+
+          place_sql = f"""
+          SELECT
+              id AS overture_id,
+              coalesce(map_extract_value(names.common, 'zh-Hans'),
+                       map_extract_value(names.common, 'zh'),
+                       names.primary) AS name,
+              names.primary AS source_primary_name,
+              basic_category,
+              taxonomy.primary AS taxonomy_primary,
+              array_to_string(taxonomy.hierarchy, ' > ') AS taxonomy_hierarchy,
+              confidence,
+              addresses[1].freeform AS address_freeform,
+              addresses[1].locality AS address_locality,
+              addresses[1].region AS address_region,
+              addresses[1].postcode AS address_postcode,
+              addresses[1].country AS address_country,
+              websites[1] AS website,
+              phones[1] AS phone,
+              sources[1].dataset AS source_dataset,
+              sources[1].license AS source_license,
+              sources[1].record_id AS source_record_id,
+              sources[1].update_time AS source_update_time,
+              operating_status,
+              ST_X(geometry) AS longitude_wgs84,
+              ST_Y(geometry) AS latitude_wgs84,
+              version AS overture_version
+          FROM read_parquet('{places}', hive_partitioning=1)
+          WHERE {bbox}
+            AND {named}
+            AND addresses[1].country IN {countries}
+            AND {candidate}
+          ORDER BY address_country, overture_id
+          """
+          con.execute(f"COPY ({place_sql}) TO '{out/'overture_cn_named_heritage_candidates.csv'}' (HEADER, DELIMITER ',')")
+
+          category_sql = f"""
+          SELECT addresses[1].country AS country,
+                 coalesce(basic_category,'(null)') AS basic_category,
+                 coalesce(taxonomy.primary,'(null)') AS taxonomy_primary,
+                 count(*) AS record_count,
+                 sum(CASE WHEN addresses[1].freeform IS NOT NULL AND trim(addresses[1].freeform)<>'' THEN 1 ELSE 0 END) AS with_freeform_address,
+                 sum(CASE WHEN addresses[1].locality IS NOT NULL AND trim(addresses[1].locality)<>'' THEN 1 ELSE 0 END) AS with_locality,
+                 avg(confidence) AS mean_confidence
+          FROM read_parquet('{places}', hive_partitioning=1)
+          WHERE {bbox} AND {named} AND addresses[1].country IN {countries} AND {candidate}
+          GROUP BY 1,2,3 ORDER BY record_count DESC, country, basic_category, taxonomy_primary
+          """
+          con.execute(f"COPY ({category_sql}) TO '{out/'overture_cn_candidate_category_summary.csv'}' (HEADER, DELIMITER ',')")
+
+          division_sql = f"""
+          SELECT
+              id AS division_id,
+              coalesce(map_extract_value(names.common, 'zh-Hans'),
+                       map_extract_value(names.common, 'zh'),
+                       names.primary) AS name,
+              names.primary AS source_primary_name,
+              subtype,
+              local_type,
+              country,
+              region,
+              admin_level,
+              parent_division_id,
+              array_to_string(list_transform(hierarchies[1], x -> x.division_id), ' > ') AS hierarchy_division_ids,
+              population,
+              cartography.prominence AS prominence,
+              ST_X(geometry) AS longitude_wgs84,
+              ST_Y(geometry) AS latitude_wgs84,
+              version AS overture_version,
+              sources[1].dataset AS source_dataset,
+              sources[1].license AS source_license,
+              sources[1].record_id AS source_record_id
+          FROM read_parquet('{divisions}', hive_partitioning=1)
+          WHERE country IN {countries}
+            AND subtype IN ('country','region','county','localadmin','locality','borough','macrohood','neighborhood','microhood')
+            AND names.primary IS NOT NULL AND trim(names.primary) <> ''
+          ORDER BY country, subtype, division_id
+          """
+          con.execute(f"COPY ({division_sql}) TO '{out/'overture_cn_division_labels.csv'}' (HEADER, DELIMITER ',')")
+
+          def count_csv(path):
+              with path.open('r', encoding='utf-8-sig', newline='') as f:
+                  return sum(1 for _ in f) - 1
+          def sha256(path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for b in iter(lambda:f.read(1024*1024),b''):
+                      h.update(b)
+              return h.hexdigest()
+
+          place_file = out/'overture_cn_named_heritage_candidates.csv'
+          division_file = out/'overture_cn_division_labels.csv'
+          metadata = {
+              'release': release,
+              'countries': ['CN','HK','MO','TW'],
+              'candidate_rule': 'cultural_and_historic hierarchy OR religious_organization hierarchy OR museum/cultural_center',
+              'place_records': count_csv(place_file),
+              'division_label_records': count_csv(division_file),
+              'files': {}
+          }
+          for p in sorted(out.glob('*')):
+              if p.is_file():
+                  metadata['files'][p.name]={'bytes':p.stat().st_size,'sha256':sha256(p)}
+          (out/'metadata.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(metadata,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload export artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: overture-cn-heritage-localities-export
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
