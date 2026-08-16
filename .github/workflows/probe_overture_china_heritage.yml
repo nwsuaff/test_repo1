@@ -17,19 +17,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --quiet duckdb==1.3.2 requests
+          python -m pip install --quiet duckdb==1.3.2
       - name: Probe schema and category counts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p out
           python - <<'PY'
-          import json, requests, duckdb
+          import json, duckdb
           from pathlib import Path
 
           out = Path('out')
-          catalog = requests.get('https://stac.overturemaps.org/catalog.json', timeout=60).json()
-          release = catalog.get('latest') or '2026-06-17.0'
+          release = '2026-06-17.0'
           path = f"s3://overturemaps-us-west-2/release/{release}/theme=places/type=place/*"
           con = duckdb.connect()
           con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
@@ -43,6 +42,24 @@ jobs:
           count_named = con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''").fetchone()[0]
           summary = {'release': release, 'path': path, 'bbox_count': count_all, 'named_bbox_count': count_named}
           (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          candidate_condition = """
+             list_contains(taxonomy.hierarchy, 'cultural_and_historic')
+             OR list_contains(taxonomy.hierarchy, 'religious_organization')
+             OR list_contains(taxonomy.hierarchy, 'arts_and_entertainment')
+             OR lower(coalesce(basic_category,'')) LIKE ANY (ARRAY[
+               '%relig%', '%church%', '%temple%', '%mosque%', '%shrine%', '%monaster%',
+               '%cathedral%', '%synagogue%', '%pagoda%', '%museum%', '%historic%',
+               '%heritage%', '%memorial%', '%monument%', '%landmark%', '%village%',
+               '%palace%', '%castle%', '%fort%', '%archaeolog%', '%cultural%', '%attraction%'
+             ])
+             OR lower(coalesce(taxonomy.primary,'')) LIKE ANY (ARRAY[
+               '%relig%', '%church%', '%temple%', '%mosque%', '%shrine%', '%monaster%',
+               '%cathedral%', '%synagogue%', '%pagoda%', '%museum%', '%historic%',
+               '%heritage%', '%memorial%', '%monument%', '%landmark%', '%village%',
+               '%palace%', '%castle%', '%fort%', '%archaeolog%', '%cultural%', '%attraction%'
+             ])
+          """
 
           queries = {
             'basic_category_counts.csv': f"""
@@ -63,18 +80,32 @@ jobs:
                      count(*) AS n
               FROM read_parquet('{path}', hive_partitioning=1)
               WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
-                AND (
-                  lower(coalesce(basic_category,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
-                  OR lower(coalesce(taxonomy.primary,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
-                )
+                AND ({candidate_condition})
               GROUP BY 1,2 ORDER BY n DESC, basic_category, taxonomy_primary
             """,
           }
           for filename, sql in queries.items():
               con.execute(f"COPY ({sql}) TO '{out/filename}' (HEADER, DELIMITER ',');")
 
+          candidate_count = con.execute(f"""
+            SELECT count(*)
+            FROM read_parquet('{path}', hive_partitioning=1)
+            WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
+              AND ({candidate_condition})
+          """).fetchone()[0]
+          address_count = con.execute(f"""
+            SELECT count(*)
+            FROM read_parquet('{path}', hive_partitioning=1)
+            WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
+              AND ({candidate_condition})
+              AND addresses[1].freeform IS NOT NULL AND trim(addresses[1].freeform) <> ''
+          """).fetchone()[0]
+          summary.update({'candidate_count': candidate_count, 'candidate_with_freeform_address': address_count})
+          (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
           sample_sql = f"""
             SELECT id, names.primary AS name, basic_category, taxonomy.primary AS taxonomy_primary,
+                   array_to_string(taxonomy.hierarchy, ' > ') AS taxonomy_hierarchy,
                    confidence,
                    addresses[1].freeform AS address,
                    addresses[1].locality AS locality,
@@ -83,11 +114,8 @@ jobs:
                    ST_X(geometry) AS longitude, ST_Y(geometry) AS latitude
             FROM read_parquet('{path}', hive_partitioning=1)
             WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
-              AND (
-                  lower(coalesce(basic_category,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
-                  OR lower(coalesce(taxonomy.primary,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
-              )
-            LIMIT 500
+              AND ({candidate_condition})
+            LIMIT 1000
           """
           con.execute(f"COPY ({sample_sql}) TO '{out/'candidate_sample.csv'}' (HEADER, DELIMITER ',');")
           print(json.dumps(summary, ensure_ascii=False, indent=2))
