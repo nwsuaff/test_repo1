@@ -43,22 +43,12 @@ jobs:
           summary = {'release': release, 'path': path, 'bbox_count': count_all, 'named_bbox_count': count_named}
           (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
 
-          candidate_condition = """
+          regex = '(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|attraction)'
+          candidate_condition = f"""
              list_contains(taxonomy.hierarchy, 'cultural_and_historic')
              OR list_contains(taxonomy.hierarchy, 'religious_organization')
-             OR list_contains(taxonomy.hierarchy, 'arts_and_entertainment')
-             OR lower(coalesce(basic_category,'')) LIKE ANY (ARRAY[
-               '%relig%', '%church%', '%temple%', '%mosque%', '%shrine%', '%monaster%',
-               '%cathedral%', '%synagogue%', '%pagoda%', '%museum%', '%historic%',
-               '%heritage%', '%memorial%', '%monument%', '%landmark%', '%village%',
-               '%palace%', '%castle%', '%fort%', '%archaeolog%', '%cultural%', '%attraction%'
-             ])
-             OR lower(coalesce(taxonomy.primary,'')) LIKE ANY (ARRAY[
-               '%relig%', '%church%', '%temple%', '%mosque%', '%shrine%', '%monaster%',
-               '%cathedral%', '%synagogue%', '%pagoda%', '%museum%', '%historic%',
-               '%heritage%', '%memorial%', '%monument%', '%landmark%', '%village%',
-               '%palace%', '%castle%', '%fort%', '%archaeolog%', '%cultural%', '%attraction%'
-             ])
+             OR regexp_matches(lower(coalesce(basic_category,'')), '{regex}')
+             OR regexp_matches(lower(coalesce(taxonomy.primary,'')), '{regex}')
           """
 
           queries = {
