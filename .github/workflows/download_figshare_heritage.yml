@@ -1,0 +1,36 @@
+name: download-figshare-heritage
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Figshare historical-relic database
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          curl -L --fail --retry 5 --retry-delay 2 \
+            -A 'Mozilla/5.0 heritage-data-expansion/1.0' \
+            'https://figshare.com/ndownloader/files/58654255' \
+            -o artifact/Historicalreliccomprehensivedatabase.zip
+          cd artifact
+          sha256sum Historicalreliccomprehensivedatabase.zip > SHA256SUMS.txt
+          unzip -l Historicalreliccomprehensivedatabase.zip > ARCHIVE_CONTENTS.txt
+          mkdir extracted
+          unzip -q Historicalreliccomprehensivedatabase.zip -d extracted
+          find extracted -maxdepth 4 -type f -printf '%p\t%s bytes\n' | sort > EXTRACTED_FILES.txt
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: figshare-historical-relic-database
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
