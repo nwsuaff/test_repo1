@@ -1,0 +1,88 @@
+name: probe-overture-china-country
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install DuckDB
+        run: python -m pip install --quiet duckdb==1.3.2
+      - name: Count China records by country code
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          import json, duckdb
+          from pathlib import Path
+          out=Path('out')
+          release='2026-06-17.0'
+          path=f"s3://overturemaps-us-west-2/release/{release}/theme=places/type=place/*"
+          con=duckdb.connect()
+          con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
+          con.execute("SET s3_region='us-west-2'; SET enable_progress_bar=false;")
+          named="names.primary IS NOT NULL AND trim(names.primary)<>''"
+          china="addresses[1].country='CN'"
+          regex='(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|attraction)'
+          candidate=f"""(
+             list_contains(taxonomy.hierarchy, 'cultural_and_historic')
+             OR list_contains(taxonomy.hierarchy, 'religious_organization')
+             OR regexp_matches(lower(coalesce(basic_category,'')), '{regex}')
+             OR regexp_matches(lower(coalesce(taxonomy.primary,'')), '{regex}')
+          )"""
+          totals={}
+          totals['all_cn']=con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {named} AND {china}").fetchone()[0]
+          totals['candidate_cn']=con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {named} AND {china} AND {candidate}").fetchone()[0]
+          totals['candidate_cn_with_freeform_address']=con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {named} AND {china} AND {candidate} AND addresses[1].freeform IS NOT NULL AND trim(addresses[1].freeform)<>''").fetchone()[0]
+          totals['candidate_cn_confidence_ge_050']=con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {named} AND {china} AND {candidate} AND confidence>=0.5").fetchone()[0]
+          totals['candidate_cn_confidence_ge_070']=con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {named} AND {china} AND {candidate} AND confidence>=0.7").fetchone()[0]
+          totals['release']=release
+          (out/'summary.json').write_text(json.dumps(totals,ensure_ascii=False,indent=2),encoding='utf-8')
+          sql=f"""
+            SELECT coalesce(basic_category,'(null)') basic_category,
+                   coalesce(taxonomy.primary,'(null)') taxonomy_primary,
+                   count(*) n,
+                   sum(CASE WHEN addresses[1].freeform IS NOT NULL AND trim(addresses[1].freeform)<>'' THEN 1 ELSE 0 END) with_address,
+                   avg(confidence) mean_confidence
+            FROM read_parquet('{path}', hive_partitioning=1)
+            WHERE {named} AND {china} AND {candidate}
+            GROUP BY 1,2 ORDER BY n DESC,1,2
+          """
+          con.execute(f"COPY ({sql}) TO '{out/'category_counts_cn.csv'}' (HEADER, DELIMITER ',')")
+          sample=f"""
+            SELECT id,
+                   coalesce(map_extract_value(names.common,'zh-Hans'), map_extract_value(names.common,'zh'), names.primary) AS name,
+                   names.primary AS source_primary_name,
+                   basic_category,
+                   taxonomy.primary taxonomy_primary,
+                   array_to_string(taxonomy.hierarchy,' > ') taxonomy_hierarchy,
+                   confidence,
+                   addresses[1].freeform address,
+                   addresses[1].locality locality,
+                   addresses[1].region region,
+                   addresses[1].postcode postcode,
+                   addresses[1].country country,
+                   ST_X(geometry) longitude, ST_Y(geometry) latitude
+            FROM read_parquet('{path}', hive_partitioning=1)
+            WHERE {named} AND {china} AND {candidate}
+            ORDER BY confidence DESC, id
+            LIMIT 2000
+          """
+          con.execute(f"COPY ({sample}) TO '{out/'sample_cn.csv'}' (HEADER, DELIMITER ',')")
+          print(json.dumps(totals,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: overture-china-country-probe
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
