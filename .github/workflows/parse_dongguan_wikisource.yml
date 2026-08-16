@@ -1,0 +1,31 @@
+name: parse-dongguan-wikisource
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/parse_dongguan_wikisource.py'
+      - '.github/workflows/parse_dongguan_wikisource.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install requests beautifulsoup4 lxml
+      - name: Parse Dongguan mirror and reconcile official total
+        run: python .github/scripts/parse_dongguan_wikisource.py
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongguan-census-parsed
+          path: dongguan_out/
+          if-no-files-found: error
+          retention-days: 7
