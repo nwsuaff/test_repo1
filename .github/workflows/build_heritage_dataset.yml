@@ -1,0 +1,181 @@
+name: build-heritage-dataset
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and filter national protected-site KML
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from collections import Counter
+          from datetime import datetime, timezone
+
+          SOURCE_COMMIT = "3a844a159388fdf2ed93a63fcfdefda88306a188"
+          SOURCE_BLOB_SHA = "d5c6927b14f5f35c46275d99c683b41ff939c6d4"
+          SOURCE_URL = f"https://raw.githubusercontent.com/lzq1206/CulturalWhisper/{SOURCE_COMMIT}/data/CulRelPro_China_1961-2019.kml"
+          TARGET = {"古建筑", "近现代重要史迹及代表性建筑"}
+          OUT_DIR = "out"
+          os.makedirs(OUT_DIR, exist_ok=True)
+          raw_path = os.path.join(OUT_DIR, "CulRelPro_China_1961-2019.kml")
+
+          req = urllib.request.Request(SOURCE_URL, headers={"User-Agent": "heritage-dataset-builder/1.0"})
+          with urllib.request.urlopen(req, timeout=180) as r, open(raw_path, "wb") as f:
+              while True:
+                  chunk = r.read(1024 * 1024)
+                  if not chunk:
+                      break
+                  f.write(chunk)
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          fields = [
+              "source_index", "source_city", "longitude_wgs84", "latitude_wgs84",
+              "national_code", "relic_name", "relic_name_en", "era_raw", "address_raw",
+              "category_standard", "protection_level_standard", "batch_raw",
+              "province_cn", "prefecture_cn", "county_district_cn", "publication_name",
+              "placemark_name", "source_commit", "source_blob_sha", "source_url"
+          ]
+          all_rows = []
+          target_rows = []
+          category_counts = Counter()
+          batch_counts = Counter()
+          category_batch_counts = Counter()
+          missing = Counter()
+
+          # Stream parse to keep memory bounded.
+          for event, elem in ET.iterparse(raw_path, events=("end",)):
+              if not elem.tag.endswith("Placemark"):
+                  continue
+              data = {}
+              placemark_name = ""
+              coord_text = ""
+              for child in elem.iter():
+                  tag = child.tag.rsplit("}", 1)[-1]
+                  if tag == "name" and child is not elem and not placemark_name:
+                      placemark_name = (child.text or "").strip()
+                  elif tag == "SimpleData":
+                      key = (child.attrib.get("name") or "").strip()
+                      if key:
+                          data[key] = (child.text or "").strip()
+                  elif tag == "coordinates" and child.text:
+                      coord_text = child.text.strip()
+              lon = data.get("LON84", "")
+              lat = data.get("LAT84", "")
+              if (not lon or not lat) and coord_text:
+                  first = coord_text.split()[0].split(",")
+                  if len(first) >= 2:
+                      lon = lon or first[0].strip()
+                      lat = lat or first[1].strip()
+              category = data.get("TCN", "").strip()
+              row = {
+                  "source_index": data.get("Index", ""),
+                  "source_city": data.get("City", ""),
+                  "longitude_wgs84": lon,
+                  "latitude_wgs84": lat,
+                  "national_code": data.get("Cnum", ""),
+                  "relic_name": data.get("NameCN", "") or placemark_name,
+                  "relic_name_en": data.get("NameEN", ""),
+                  "era_raw": data.get("PCN", ""),
+                  "address_raw": data.get("AddCN", ""),
+                  "category_standard": category,
+                  "protection_level_standard": "国家级",
+                  "batch_raw": data.get("PackCN", "") or data.get("Batch", ""),
+                  "province_cn": data.get("PADCN", ""),
+                  "prefecture_cn": data.get("MADCN", ""),
+                  "county_district_cn": data.get("CADCN", ""),
+                  "publication_name": data.get("PubName", ""),
+                  "placemark_name": placemark_name,
+                  "source_commit": SOURCE_COMMIT,
+                  "source_blob_sha": SOURCE_BLOB_SHA,
+                  "source_url": SOURCE_URL,
+              }
+              all_rows.append(row)
+              category_counts[category or "（空）"] += 1
+              batch_counts[row["batch_raw"] or "（空）"] += 1
+              category_batch_counts[(category or "（空）", row["batch_raw"] or "（空）")] += 1
+              for key in ("relic_name", "category_standard", "province_cn", "longitude_wgs84", "latitude_wgs84"):
+                  if not row[key]:
+                      missing[key] += 1
+              if category in TARGET:
+                  target_rows.append(row)
+              elem.clear()
+
+          # Stable source order; no coordinate de-duplication because distinct protected units may share points.
+          def write_csv(path, rows, headers):
+              with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+                  w.writeheader()
+                  w.writerows(rows)
+
+          write_csv(os.path.join(OUT_DIR, "national_all_records.csv"), all_rows, fields)
+          write_csv(os.path.join(OUT_DIR, "national_target_records.csv"), target_rows, fields)
+
+          with open(os.path.join(OUT_DIR, "national_category_summary.csv"), "w", encoding="utf-8-sig", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["category_standard", "record_count"])
+              for k, v in sorted(category_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+                  w.writerow([k, v])
+
+          with open(os.path.join(OUT_DIR, "national_category_batch_summary.csv"), "w", encoding="utf-8-sig", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["category_standard", "batch_raw", "record_count"])
+              for (cat, batch), v in sorted(category_batch_counts.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+                  w.writerow([cat, batch, v])
+
+          metadata = {
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "source_url": SOURCE_URL,
+              "source_commit": SOURCE_COMMIT,
+              "source_blob_sha": SOURCE_BLOB_SHA,
+              "downloaded_kml_sha256": sha256_file(raw_path),
+              "all_placemark_count": len(all_rows),
+              "target_categories": sorted(TARGET),
+              "target_record_count": len(target_rows),
+              "target_category_counts": {k: category_counts.get(k, 0) for k in sorted(TARGET)},
+              "category_counts": dict(sorted(category_counts.items())),
+              "batch_counts": dict(sorted(batch_counts.items())),
+              "missing_required_field_counts": dict(sorted(missing.items())),
+              "parser": "Python xml.etree.ElementTree iterparse",
+              "deduplication": "none; source placemarks preserved exactly",
+          }
+          with open(os.path.join(OUT_DIR, "national_source_metadata.json"), "w", encoding="utf-8") as f:
+              json.dump(metadata, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+          with open(os.path.join(OUT_DIR, "SHA256SUMS.txt"), "w", encoding="utf-8") as out:
+              for name in sorted(os.listdir(OUT_DIR)):
+                  path = os.path.join(OUT_DIR, name)
+                  if os.path.isfile(path) and name != "SHA256SUMS.txt":
+                      out.write(f"{sha256_file(path)}  {name}\n")
+
+          print(json.dumps(metadata, ensure_ascii=False, indent=2))
+          PY
+      - name: Upload filtered data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: national-heritage-filtered-data
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
