@@ -1,0 +1,101 @@
+name: probe-overture-china-heritage
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install DuckDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet duckdb==1.3.2 requests
+      - name: Probe schema and category counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          import json, requests, duckdb
+          from pathlib import Path
+
+          out = Path('out')
+          catalog = requests.get('https://stac.overturemaps.org/catalog.json', timeout=60).json()
+          release = catalog.get('latest') or '2026-06-17.0'
+          path = f"s3://overturemaps-us-west-2/release/{release}/theme=places/type=place/*"
+          con = duckdb.connect()
+          con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
+          con.execute("SET s3_region='us-west-2';")
+          con.execute("SET enable_progress_bar=false;")
+          schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}', hive_partitioning=1) LIMIT 1").fetchall()
+          (out/'schema.json').write_text(json.dumps(schema, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+
+          bbox = "bbox.xmin BETWEEN 73.0 AND 135.5 AND bbox.ymin BETWEEN 18.0 AND 54.0"
+          count_all = con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {bbox}").fetchone()[0]
+          count_named = con.execute(f"SELECT count(*) FROM read_parquet('{path}', hive_partitioning=1) WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''").fetchone()[0]
+          summary = {'release': release, 'path': path, 'bbox_count': count_all, 'named_bbox_count': count_named}
+          (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          queries = {
+            'basic_category_counts.csv': f"""
+              SELECT coalesce(basic_category, '(null)') AS basic_category, count(*) AS n
+              FROM read_parquet('{path}', hive_partitioning=1)
+              WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
+              GROUP BY 1 ORDER BY n DESC, basic_category LIMIT 3000
+            """,
+            'taxonomy_counts.csv': f"""
+              SELECT coalesce(taxonomy.primary, '(null)') AS taxonomy_primary, count(*) AS n
+              FROM read_parquet('{path}', hive_partitioning=1)
+              WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
+              GROUP BY 1 ORDER BY n DESC, taxonomy_primary LIMIT 3000
+            """,
+            'candidate_category_counts.csv': f"""
+              SELECT coalesce(basic_category, '(null)') AS basic_category,
+                     coalesce(taxonomy.primary, '(null)') AS taxonomy_primary,
+                     count(*) AS n
+              FROM read_parquet('{path}', hive_partitioning=1)
+              WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
+                AND (
+                  lower(coalesce(basic_category,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
+                  OR lower(coalesce(taxonomy.primary,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
+                )
+              GROUP BY 1,2 ORDER BY n DESC, basic_category, taxonomy_primary
+            """,
+          }
+          for filename, sql in queries.items():
+              con.execute(f"COPY ({sql}) TO '{out/filename}' (HEADER, DELIMITER ',');")
+
+          sample_sql = f"""
+            SELECT id, names.primary AS name, basic_category, taxonomy.primary AS taxonomy_primary,
+                   confidence,
+                   addresses[1].freeform AS address,
+                   addresses[1].locality AS locality,
+                   addresses[1].region AS region,
+                   addresses[1].country AS country,
+                   ST_X(geometry) AS longitude, ST_Y(geometry) AS latitude
+            FROM read_parquet('{path}', hive_partitioning=1)
+            WHERE {bbox} AND names.primary IS NOT NULL AND trim(names.primary) <> ''
+              AND (
+                  lower(coalesce(basic_category,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
+                  OR lower(coalesce(taxonomy.primary,'')) SIMILAR TO '%(relig|church|temple|mosque|shrine|monaster|cathedral|synagogue|pagoda|museum|historic|heritage|memorial|monument|landmark|village|palace|castle|fort|archaeolog|cultural|tourist|attraction)%'
+              )
+            LIMIT 500
+          """
+          con.execute(f"COPY ({sample_sql}) TO '{out/'candidate_sample.csv'}' (HEADER, DELIMITER ',');")
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: overture-china-heritage-probe
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
