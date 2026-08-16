@@ -1,0 +1,286 @@
+name: export-osm-cn-named-heritage
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/export_osm_cn_named_heritage.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Install Osmium and Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool
+          python -m pip install --quiet shapely==2.1.1
+      - name: Download and filter current China OSM extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work out
+          curl -L --fail --retry 6 --retry-delay 5 \
+            -A 'history-building-research/1.0' \
+            'https://download.geofabrik.de/asia/china-latest.osm.pbf' \
+            -o work/china-latest.osm.pbf
+          osmium fileinfo -e work/china-latest.osm.pbf > out/osm_source_fileinfo.txt
+          osmium tags-filter work/china-latest.osm.pbf \
+            nwr/historic \
+            nwr/heritage \
+            nwr/protection_title \
+            nwr/designation \
+            nwr/amenity=place_of_worship \
+            nwr/tourism=museum,gallery \
+            nwr/building=church,chapel,cathedral,mosque,temple,synagogue,shrine,monastery,wayside_shrine \
+            nwr/religion \
+            nwr/memorial \
+            nwr/castle_type \
+            nwr/ruins=yes \
+            nwr/place=village,hamlet,isolated_dwelling,town \
+            --overwrite -o work/cn_heritage_and_settlement_refs.osm.pbf
+          osmium fileinfo -e work/cn_heritage_and_settlement_refs.osm.pbf > out/osm_filtered_fileinfo.txt
+          osmium export work/cn_heritage_and_settlement_refs.osm.pbf \
+            --overwrite -f geojsonseq -o work/cn_heritage_and_settlement_refs.geojsonseq
+      - name: Convert filtered OSM objects to normalized CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import re
+          from collections import Counter
+          from pathlib import Path
+          from shapely.geometry import shape
+
+          src = Path('work/cn_heritage_and_settlement_refs.geojsonseq')
+          out = Path('out')
+          named_path = out/'osm_cn_named_heritage_candidates.csv'
+          settlements_path = out/'osm_cn_named_settlement_references.csv'
+          rejected_path = out/'osm_rejected_or_unusable_summary.csv'
+
+          headers = [
+              'osm_id','name','name_zh','name_en','category_standard','category_detail',
+              'historic_tag','heritage_tag','heritage_operator','protection_title','designation',
+              'amenity','tourism','building','religion','denomination','memorial','castle_type','ruins',
+              'heritage_level_interpreted','level_interpretation_basis',
+              'address_full','addr_province','addr_city','addr_district','addr_county','addr_suburb',
+              'addr_street','addr_housenumber','postcode','is_in',
+              'longitude_wgs84','latitude_wgs84','geometry_type',
+              'source_dataset','source_snapshot','source_url','source_license','tags_json'
+          ]
+          settlement_headers = [
+              'osm_id','name','name_zh','name_en','place_type','population','address_full',
+              'addr_province','addr_city','addr_district','addr_county','addr_suburb','is_in',
+              'longitude_wgs84','latitude_wgs84','geometry_type','source_snapshot','tags_json'
+          ]
+
+          counters = Counter()
+          category_counts = Counter()
+          level_counts = Counter()
+          snapshot = 'Geofabrik China latest extract downloaded 2026-08-16'
+
+          def first(tags, *keys):
+              for key in keys:
+                  value = tags.get(key)
+                  if value is not None and str(value).strip():
+                      return str(value).strip()
+              return ''
+
+          def clean_name(tags):
+              zh = first(tags, 'name:zh-Hans','name:zh','name:zh_CN','name:zh-cn')
+              en = first(tags, 'name:en')
+              primary = zh or first(tags,'name','official_name','short_name','loc_name','alt_name') or en
+              return primary, zh, en
+
+          def address(tags):
+              full = first(tags,'addr:full','address')
+              if full:
+                  return full
+              parts = [
+                  first(tags,'addr:province'), first(tags,'addr:city'),
+                  first(tags,'addr:district','addr:county'), first(tags,'addr:suburb'),
+                  first(tags,'addr:street'), first(tags,'addr:housenumber')
+              ]
+              return ''.join(dict.fromkeys([p for p in parts if p]))
+
+          def interpret_level(tags):
+              texts = ' | '.join([
+                  first(tags,'protection_title'), first(tags,'designation'),
+                  first(tags,'heritage:operator'), first(tags,'heritage'),
+                  first(tags,'description'), first(tags,'note')
+              ])
+              if re.search(r'全国重点文物保护单位|国家级文物保护单位|国家重点保护|national key cultural relic', texts, re.I):
+                  return '国家级', 'OSM保护称号文本明确标注国家级'
+              if re.search(r'省级文物保护单位|省文物保护单位|provincial', texts, re.I):
+                  return '省级', 'OSM保护称号文本明确标注省级'
+              if re.search(r'市级文物保护单位|市文物保护单位|municipal', texts, re.I):
+                  return '市级', 'OSM保护称号文本明确标注市级'
+              if re.search(r'县级文物保护单位|区级文物保护单位|county', texts, re.I):
+                  return '县区级', 'OSM保护称号文本明确标注县区级'
+              if first(tags,'heritage','protection_title','designation'):
+                  return '保护对象（具体等级待核验）', 'OSM存在保护相关标签但等级不足以可靠解释'
+              return '未核定（开放地图候选）', 'OSM未提供可核验的法定文物等级'
+
+          def classify(tags):
+              historic = first(tags,'historic')
+              amenity = first(tags,'amenity')
+              tourism = first(tags,'tourism')
+              building = first(tags,'building')
+              religion = first(tags,'religion')
+              heritage = first(tags,'heritage')
+              protection = first(tags,'protection_title','designation')
+              if amenity == 'place_of_worship' or religion or building in {
+                  'church','chapel','cathedral','mosque','temple','synagogue','shrine','monastery','wayside_shrine'
+              }:
+                  return '宗教建筑及宗教场所', religion or building or amenity
+              if tourism in {'museum','gallery'}:
+                  return '博物馆及纪念展示建筑', tourism
+              if historic:
+                  mapping = {
+                      'building':'历史建筑','castle':'城堡及宫殿建筑','church':'历史宗教建筑',
+                      'monastery':'历史宗教建筑','mosque':'历史宗教建筑','temple':'历史宗教建筑',
+                      'ruins':'历史遗址','archaeological_site':'考古遗址','monument':'纪念性构筑物',
+                      'memorial':'纪念性构筑物','tomb':'墓葬','wayside_shrine':'历史宗教建筑',
+                      'fort':'军事历史建筑','citywalls':'历史城防设施','tower':'历史塔楼'
+                  }
+                  return mapping.get(historic,'历史文化对象'), historic
+              if heritage or protection:
+                  return '保护对象（类别待核验）', heritage or protection
+              if first(tags,'memorial'):
+                  return '纪念性构筑物', first(tags,'memorial')
+              if first(tags,'castle_type'):
+                  return '城堡及宫殿建筑', first(tags,'castle_type')
+              if first(tags,'ruins') == 'yes':
+                  return '历史遗址', 'ruins=yes'
+              return '', ''
+
+          def representative_point(geometry):
+              geom = shape(geometry)
+              if geom.is_empty:
+                  return None
+              if geom.geom_type == 'Point':
+                  p = geom
+              else:
+                  p = geom.representative_point()
+              return float(p.x), float(p.y), geom.geom_type
+
+          with named_path.open('w',encoding='utf-8-sig',newline='') as nf, \
+               settlements_path.open('w',encoding='utf-8-sig',newline='') as sf:
+              nw=csv.DictWriter(nf,fieldnames=headers); nw.writeheader()
+              sw=csv.DictWriter(sf,fieldnames=settlement_headers); sw.writeheader()
+
+              with src.open('r',encoding='utf-8',errors='replace') as f:
+                  for line in f:
+                      line=line.lstrip('\x1e').strip()
+                      if not line:
+                          continue
+                      counters['geojson_features'] += 1
+                      try:
+                          feature=json.loads(line)
+                          tags=feature.get('properties') or {}
+                          name,name_zh,name_en=clean_name(tags)
+                          if not name or re.fullmatch(r'[\d\W_]+',name):
+                              counters['rejected_missing_or_invalid_name'] += 1
+                              continue
+                          rp=representative_point(feature.get('geometry'))
+                          if not rp:
+                              counters['rejected_missing_geometry'] += 1
+                              continue
+                          lon,lat,geom_type=rp
+                          if not (72 <= lon <= 136 and 16 <= lat <= 55):
+                              counters['rejected_outside_china_bbox'] += 1
+                              continue
+                          osm_id=first(tags,'@id','id') or str(feature.get('id') or '')
+                          place_type=first(tags,'place')
+                          if place_type in {'village','hamlet','isolated_dwelling','town'}:
+                              sw.writerow({
+                                  'osm_id':osm_id,'name':name,'name_zh':name_zh,'name_en':name_en,
+                                  'place_type':place_type,'population':first(tags,'population'),
+                                  'address_full':address(tags),'addr_province':first(tags,'addr:province'),
+                                  'addr_city':first(tags,'addr:city'),'addr_district':first(tags,'addr:district'),
+                                  'addr_county':first(tags,'addr:county'),'addr_suburb':first(tags,'addr:suburb'),
+                                  'is_in':first(tags,'is_in'),'longitude_wgs84':lon,'latitude_wgs84':lat,
+                                  'geometry_type':geom_type,'source_snapshot':snapshot,
+                                  'tags_json':json.dumps(tags,ensure_ascii=False,sort_keys=True,separators=(',',':'))
+                              })
+                              counters['named_settlement_references'] += 1
+
+                          category,detail=classify(tags)
+                          if not category:
+                              counters['rejected_not_heritage_after_filter'] += 1
+                              continue
+                          level,basis=interpret_level(tags)
+                          record={
+                              'osm_id':osm_id,'name':name,'name_zh':name_zh,'name_en':name_en,
+                              'category_standard':category,'category_detail':detail,
+                              'historic_tag':first(tags,'historic'),'heritage_tag':first(tags,'heritage'),
+                              'heritage_operator':first(tags,'heritage:operator'),
+                              'protection_title':first(tags,'protection_title'),
+                              'designation':first(tags,'designation'),'amenity':first(tags,'amenity'),
+                              'tourism':first(tags,'tourism'),'building':first(tags,'building'),
+                              'religion':first(tags,'religion'),'denomination':first(tags,'denomination'),
+                              'memorial':first(tags,'memorial'),'castle_type':first(tags,'castle_type'),
+                              'ruins':first(tags,'ruins'),'heritage_level_interpreted':level,
+                              'level_interpretation_basis':basis,'address_full':address(tags),
+                              'addr_province':first(tags,'addr:province'),'addr_city':first(tags,'addr:city'),
+                              'addr_district':first(tags,'addr:district'),'addr_county':first(tags,'addr:county'),
+                              'addr_suburb':first(tags,'addr:suburb'),'addr_street':first(tags,'addr:street'),
+                              'addr_housenumber':first(tags,'addr:housenumber'),'postcode':first(tags,'addr:postcode'),
+                              'is_in':first(tags,'is_in'),'longitude_wgs84':lon,'latitude_wgs84':lat,
+                              'geometry_type':geom_type,'source_dataset':'OpenStreetMap via Geofabrik',
+                              'source_snapshot':snapshot,'source_url':'https://download.geofabrik.de/asia/china.html',
+                              'source_license':'ODbL 1.0','tags_json':json.dumps(tags,ensure_ascii=False,sort_keys=True,separators=(',',':'))
+                          }
+                          nw.writerow(record)
+                          counters['named_heritage_candidates'] += 1
+                          category_counts[category] += 1
+                          level_counts[level] += 1
+                      except Exception:
+                          counters['rejected_parse_or_geometry_error'] += 1
+
+          def sha256(path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for b in iter(lambda:f.read(1024*1024),b''):
+                      h.update(b)
+              return h.hexdigest()
+
+          with (out/'osm_category_summary.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.writer(f); w.writerow(['category_standard','record_count'])
+              for k,v in category_counts.most_common(): w.writerow([k,v])
+          with (out/'osm_level_summary.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.writer(f); w.writerow(['heritage_level_interpreted','record_count'])
+              for k,v in level_counts.most_common(): w.writerow([k,v])
+          with rejected_path.open('w',encoding='utf-8-sig',newline='') as f:
+              w=csv.writer(f); w.writerow(['metric','count'])
+              for k,v in sorted(counters.items()): w.writerow([k,v])
+
+          metadata={'counters':dict(counters),'category_counts':dict(category_counts),'level_counts':dict(level_counts),'files':{}}
+          for p in sorted(out.glob('*')):
+              if p.is_file(): metadata['files'][p.name]={'bytes':p.stat().st_size,'sha256':sha256(p)}
+          (out/'metadata.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(metadata,ensure_ascii=False,indent=2))
+          PY
+      - name: Compress CSV outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -9 -k out/osm_cn_named_heritage_candidates.csv
+          gzip -9 -k out/osm_cn_named_settlement_references.csv
+      - name: Upload OSM export artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: osm-cn-named-heritage-export
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
