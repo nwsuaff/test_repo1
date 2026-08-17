@@ -1,0 +1,200 @@
+name: enrich-heritage-admin-20260817
+
+on:
+  push:
+    branches: [heritage-enrichment-20260817]
+    paths:
+      - '.github/workflows/enrich_heritage_admin_20260817.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Download existing OSM and Overture artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-cn-*-export'
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: nwsuaff/test_repo1
+          run-id: 31967488702
+          path: input_osm
+
+      - name: Download Overture place artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: overture-cn-heritage-localities-export
+          github-token: ${{ github.token }}
+          repository: nwsuaff/test_repo1
+          run-id: 31967488717
+          path: input_overture
+
+      - name: Install DuckDB
+        run: python -m pip install --quiet duckdb==1.3.2
+
+      - name: Spatially assign province prefecture and county
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find input_osm -maxdepth 3 -type f -printf '%p %s bytes\n' | sort
+          find input_overture -maxdepth 3 -type f -printf '%p %s bytes\n' | sort
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          from pathlib import Path
+          import duckdb
+
+          out = Path('out')
+          osm_files = list(Path('input_osm').rglob('osm_cn_named_heritage_candidates.csv'))
+          overture_files = list(Path('input_overture').rglob('overture_cn_named_heritage_candidates.csv'))
+          if not osm_files:
+              raise FileNotFoundError('OSM candidate CSV not found in downloaded artifact')
+          if not overture_files:
+              raise FileNotFoundError('Overture candidate CSV not found in downloaded artifact')
+          osm_csv = osm_files[0]
+          overture_csv = overture_files[0]
+
+          release = '2026-06-17.0'
+          areas = f"s3://overturemaps-us-west-2/release/{release}/theme=divisions/type=division_area/*"
+          con = duckdb.connect()
+          con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
+          con.execute("SET s3_region='us-west-2'; SET enable_progress_bar=false; SET preserve_insertion_order=false;")
+          con.execute("SET memory_limit='6GB'; SET threads=4;")
+
+          con.execute(f"""
+            CREATE TEMP TABLE admin_areas AS
+            SELECT
+              division_id,
+              coalesce(map_extract_value(names.common, 'zh-Hans'),
+                       map_extract_value(names.common, 'zh'),
+                       names.primary) AS admin_name,
+              names.primary AS admin_name_source,
+              subtype,
+              local_type,
+              country,
+              region,
+              admin_level,
+              bbox,
+              geometry,
+              ST_Area(geometry) AS area_score
+            FROM read_parquet('{areas}', hive_partitioning=1)
+            WHERE country IN ('CN','HK','MO','TW')
+              AND is_land = true
+              AND admin_level IN (1,2,3)
+              AND bbox.xmax >= 72.0 AND bbox.xmin <= 136.5
+              AND bbox.ymax >= 16.0 AND bbox.ymin <= 56.0
+              AND names.primary IS NOT NULL
+          """)
+
+          def enrich(source_csv, id_expr, out_name):
+              source_csv_sql = str(source_csv).replace("'", "''")
+              con.execute(f"""
+                CREATE OR REPLACE TEMP TABLE src AS
+                SELECT
+                  {id_expr} AS join_id,
+                  *,
+                  try_cast(longitude_wgs84 AS DOUBLE) AS _lon,
+                  try_cast(latitude_wgs84 AS DOUBLE) AS _lat,
+                  ST_Point(try_cast(longitude_wgs84 AS DOUBLE), try_cast(latitude_wgs84 AS DOUBLE)) AS _geom
+                FROM read_csv('{source_csv_sql}', header=true, all_varchar=true, sample_size=-1, ignore_errors=false)
+                WHERE try_cast(longitude_wgs84 AS DOUBLE) BETWEEN 72.0 AND 136.5
+                  AND try_cast(latitude_wgs84 AS DOUBLE) BETWEEN 16.0 AND 56.0
+              """)
+              con.execute("""
+                CREATE OR REPLACE TEMP TABLE admin_match AS
+                SELECT
+                  s.join_id,
+                  arg_min(a.admin_name, a.area_score) FILTER (WHERE a.admin_level=1) AS province_spatial,
+                  arg_min(a.admin_name, a.area_score) FILTER (WHERE a.admin_level=2) AS prefecture_spatial,
+                  arg_min(a.admin_name, a.area_score) FILTER (WHERE a.admin_level=3) AS county_spatial,
+                  arg_min(a.region, a.area_score) FILTER (WHERE a.admin_level=1) AS province_iso3166_2,
+                  count(*) FILTER (WHERE a.admin_level=1) AS province_match_count,
+                  count(*) FILTER (WHERE a.admin_level=2) AS prefecture_match_count,
+                  count(*) FILTER (WHERE a.admin_level=3) AS county_match_count
+                FROM src s
+                LEFT JOIN admin_areas a
+                  ON s._lon BETWEEN a.bbox.xmin AND a.bbox.xmax
+                 AND s._lat BETWEEN a.bbox.ymin AND a.bbox.ymax
+                 AND ST_Intersects(a.geometry, s._geom)
+                GROUP BY s.join_id
+              """)
+              out_path = out/out_name
+              con.execute(f"""
+                COPY (
+                  SELECT s.* EXCLUDE (join_id, _lon, _lat, _geom),
+                         m.province_spatial,
+                         m.prefecture_spatial,
+                         m.county_spatial,
+                         m.province_iso3166_2,
+                         m.province_match_count,
+                         m.prefecture_match_count,
+                         m.county_match_count,
+                         CASE
+                           WHEN m.province_spatial IS NOT NULL AND m.prefecture_spatial IS NOT NULL AND m.county_spatial IS NOT NULL THEN 'Overture division_area point-in-polygon: province+prefecture+county'
+                           WHEN m.province_spatial IS NOT NULL AND m.prefecture_spatial IS NOT NULL THEN 'Overture division_area point-in-polygon: province+prefecture'
+                           WHEN m.province_spatial IS NOT NULL THEN 'Overture division_area point-in-polygon: province only'
+                           ELSE 'No Overture administrative polygon match'
+                         END AS admin_enrichment_method
+                  FROM src s
+                  LEFT JOIN admin_match m USING (join_id)
+                ) TO '{str(out_path).replace("'", "''")}' (HEADER, DELIMITER ',')
+              """)
+              return out_path
+
+          osm_out = enrich(osm_csv, "'OSMROW-' || lpad(row_number() OVER ()::VARCHAR, 8, '0')", 'osm_cn_named_heritage_candidates_admin_enriched.csv')
+          overture_out = enrich(overture_csv, "overture_id", 'overture_cn_named_heritage_candidates_admin_enriched.csv')
+
+          def summarize(path):
+              with path.open('r', encoding='utf-8-sig', newline='') as f:
+                  r = csv.DictReader(f)
+                  n = p = c = d = 0
+                  for row in r:
+                      n += 1
+                      p += bool(row.get('province_spatial'))
+                      c += bool(row.get('prefecture_spatial'))
+                      d += bool(row.get('county_spatial'))
+              return {'records': n, 'with_province': p, 'with_prefecture': c, 'with_county': d}
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for b in iter(lambda: f.read(1024*1024), b''):
+                      h.update(b)
+              return h.hexdigest()
+
+          meta = {
+              'overture_release': release,
+              'admin_method': 'point-in-polygon against Overture division_area; smallest matching polygon per admin level',
+              'admin_levels': {'1':'province/region','2':'prefecture/city','3':'county/district'},
+              'osm': summarize(osm_out),
+              'overture': summarize(overture_out),
+              'files': {}
+          }
+          for p in sorted(out.glob('*')):
+              if p.is_file():
+                  meta['files'][p.name] = {'bytes': p.stat().st_size, 'sha256': sha256(p)}
+          (out/'metadata.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(meta, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Compress outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -9 -k out/*.csv
+
+      - name: Upload enriched artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: heritage-admin-enriched-20260817
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
