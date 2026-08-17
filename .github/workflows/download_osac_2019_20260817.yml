@@ -1,0 +1,49 @@
+name: download-osac-2019-20260817
+
+on:
+  push:
+    branches: [heritage-enrichment-20260817]
+    paths:
+      - '.github/workflows/download_osac_2019_20260817.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download OSAC public-domain archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p raw extracted out
+          urls=(
+            'https://pure.mpg.de/pubman/item/item_3250539_4/component/file_3250540/White_2019_Online_Spiritual_Atlas_10.zip?mode=download'
+            'https://pure.mpg.de/pubman/item/item_3250539_4/component/file_3250541/White_2019_Online_Spiritual_Atlas_20.zip?mode=download'
+          )
+          names=(White_2019_Online_Spiritual_Atlas_10.zip White_2019_Online_Spiritual_Atlas_20.zip)
+          for i in 0 1; do
+            curl -L --fail --retry 6 --retry-delay 5 \
+              -A 'Mozilla/5.0 heritage-research/1.0' \
+              -e 'https://pure.mpg.de/pubman/item/item_3250539' \
+              "${urls[$i]}" -o "raw/${names[$i]}"
+            unzip -t "raw/${names[$i]}"
+            mkdir -p "extracted/${names[$i]%.zip}"
+            unzip -o "raw/${names[$i]}" -d "extracted/${names[$i]%.zip}"
+          done
+          find raw extracted -maxdepth 8 -type f -printf '%p\t%s bytes\n' | sort > out/file_inventory.txt
+          sha256sum raw/*.zip > out/SHA256SUMS.txt
+          cp raw/*.zip out/
+          cp -r extracted out/
+          sed -n '1,400p' out/file_inventory.txt
+
+      - name: Upload OSAC artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: osac-2019-public-domain-data
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
