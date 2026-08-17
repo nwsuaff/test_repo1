@@ -1,0 +1,69 @@
+name: publish-heritage-source-artifacts-20260817
+
+on:
+  push:
+    branches:
+      - heritage-enrichment-20260817
+    paths:
+      - '.github/workflows/publish_heritage_source_artifacts_20260817.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download OSM named-heritage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: osm-cn-named-heritage-export
+          github-token: ${{ github.token }}
+          repository: nwsuaff/test_repo1
+          run-id: 31967488702
+          path: source/osm
+
+      - name: Download Overture named-heritage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: overture-cn-heritage-localities-export
+          github-token: ${{ github.token }}
+          repository: nwsuaff/test_repo1
+          run-id: 31967488717
+          path: source/overture
+
+      - name: Repack source artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          (cd source/osm && zip -9 -r ../../release/osm-cn-named-heritage-export.zip .)
+          (cd source/overture && zip -9 -r ../../release/overture-cn-heritage-localities-export.zip .)
+          sha256sum release/*.zip > release/SHA256SUMS.txt
+          ls -lh release
+
+      - name: Publish public release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: heritage-source-artifacts-20260817-v1
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Heritage source artifacts 2026-08-17" \
+              --notes "OSM and Overture named, geocoded source tables used for the 100,000+ historical-building dataset enrichment."
+          fi
+          gh release upload "$TAG" release/*.zip release/SHA256SUMS.txt --clobber
+
+      - name: Upload temporary workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: heritage-source-artifacts-20260817
+          path: release/
+          retention-days: 7
+          if-no-files-found: error
